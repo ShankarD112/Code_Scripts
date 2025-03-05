@@ -1,0 +1,200 @@
+# Usage: Use `source("/path/single_cell.R")` in your script to load these functions.
+
+# Load necessary libraries
+library(Seurat)      # Single-cell analysis package
+library(dplyr)       # Data manipulation functions
+library(ggplot2)     # Data visualization
+library(patchwork)   # Combining ggplot objects
+library(openxlsx)    # Writing and reading Excel files
+
+#----------------------------------------------------------
+# Function to Load Samples and add additional metrics
+#----------------------------------------------------------
+
+load_samples <- function(base_dir, sample_names, pattern = "^MT-", min_cells = 3, min_features = 200) {
+  # Load required library
+  library(Seurat)
+  
+  # Initialize an empty list to store the Seurat objects
+  sample_objects <- list()
+  
+  # Loop through each sample name and process its data
+  for (s in sample_names) {
+    # Define the path to the filtered feature matrix
+    data_dir <- file.path(base_dir, s, "outs", "filtered_feature_bc_matrix")
+    
+    # Check if the directory exists, if not, issue a warning and skip
+    if (!dir.exists(data_dir)) {
+      warning(paste("Directory not found for sample:", s, "Skipping..."))
+      next
+    }
+    
+    # Load the count data
+    counts <- Read10X(data.dir = data_dir)
+    
+    # Append sample name to barcodes for unique identification
+    colnames(counts) <- paste0(colnames(counts), "_", s)
+    
+    # Create a Seurat object from count data
+    seurat_obj <- CreateSeuratObject(counts = counts, project = s, min.cells = min_cells, min.features = min_features)
+    
+    # Calculate and store mitochondrial gene percentage
+    seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = pattern)
+    
+    # Store the Seurat object in the list
+    sample_objects[[s]] <- seurat_obj
+  }
+  
+  # Return the list of processed Seurat objects
+  return(sample_objects)
+}
+
+#----------------------------------------------------------
+# Function to Generate UMAP and Feature Plots
+#----------------------------------------------------------
+
+generate_seurat_plots <- function(seurat_object, reduction = "umap", group_by_list = NULL, feature_list = NULL, label = TRUE) {
+  # Generate UMAP plots based on grouping variables
+  if (!is.null(group_by_list)) {
+    for (group_by in group_by_list) {
+      print(DimPlot(seurat_object, reduction = reduction, label = label, group.by = group_by, na.value = "grey90"))
+    }
+  }
+  
+  # Generate Feature plots for selected genes
+  if (!is.null(feature_list)) {
+    for (feature in feature_list) {
+      print(FeaturePlot(seurat_object, features = feature))
+    }
+  }
+}
+
+#----------------------------------------------------------
+# Function to Save UMAP and Feature Plots
+#----------------------------------------------------------
+
+save_seurat_plots <- function(seurat_object, output_dir, reduction = "umap", group_by_list = NULL, feature_list = NULL, label = TRUE, plot_width = 8, plot_height = 6, dpi = 500) {
+  
+  # Create output directory if it does not exist
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  # Save UMAP plots
+  if (!is.null(group_by_list)) {
+    for (group_by in group_by_list) {
+      plot <- DimPlot(seurat_object, reduction = reduction, label = label, group.by = group_by)
+      filename <- file.path(output_dir, paste0("UMAP_", group_by, ".png"))
+      ggsave(filename = filename, plot = plot, width = plot_width, height = plot_height, dpi = dpi)
+    }
+  }
+  
+  # Save Feature plots
+  if (!is.null(feature_list)) {
+    for (feature in feature_list) {
+      plot <- FeaturePlot(seurat_object, features = feature)
+      filename <- file.path(output_dir, paste0("FeaturePlot_", feature, ".png"))
+      ggsave(filename = filename, plot = plot, width = plot_width, height = plot_height, dpi = dpi)
+    }
+  }
+}
+
+#----------------------------------------------------------
+# Function to Save Cluster Markers to Excel
+#----------------------------------------------------------
+
+save_markers_to_excel <- function(markers, output_path) {
+  # Split markers by cluster for better organization
+  marker_list <- split(markers, markers$cluster)
+  
+  # Include a combined sheet for all clusters
+  marker_list$All_Clusters <- markers
+  
+  # Write markers to an Excel file with multiple sheets
+  write.xlsx(marker_list, file = output_path)
+  
+  message("Markers saved to Excel file at: ", output_path)
+}
+
+#----------------------------------------------------------
+# Function to Plot Gene Expression in UMAP Space
+#----------------------------------------------------------
+
+PlotGeneList <- function(seurat_obj, gene_list, assay = "SCT", reduction = "umap") {
+  # Set the default assay
+  DefaultAssay(seurat_obj) <- assay
+  
+  # Plot each gene as a FeaturePlot
+  for (gene in gene_list) {
+    print(
+      FeaturePlot(seurat_obj, features = gene, reduction = reduction, cols = c("lightgrey", "red")) +
+        ggtitle(gene)  # Add gene name as the title
+    )
+  }
+}
+
+#----------------------------------------------------------
+# Function to Map Mouse Genes to Human Orthologs
+#----------------------------------------------------------
+
+load_orthologs_names <- function(sample_names, dir_path, orthologs_path, include_unmapped = TRUE) {
+  # Load the orthologs mapping table
+  orthologs <- read.csv(orthologs_path)
+  orthologs <- orthologs[!duplicated(orthologs$mouse_gene), ]
+  orthologs <- orthologs[complete.cases(orthologs), ]
+  
+  # Create a gene mapping dictionary
+  gene_mapping <- setNames(orthologs$human_gene, orthologs$mouse_gene)
+  
+  # Initialize a list to store Seurat objects
+  seurat_objects <- list()
+  
+  for (sample_name in sample_names) {
+    # Construct the file path
+    file_path <- file.path(dir_path, sample_name, "outs/filtered_feature_bc_matrix.h5")
+    
+    # Read the expression matrix
+    matrix_data <- Read10X_h5(file_path)
+    
+    # Map and update gene names
+    new_row_names <- gene_mapping[rownames(matrix_data)]
+    
+    if (include_unmapped) {
+      rownames(matrix_data)[!is.na(new_row_names)] <- new_row_names[!is.na(new_row_names)]
+    } else {
+      matrix_data <- matrix_data[!is.na(new_row_names), ]
+      rownames(matrix_data) <- new_row_names[!is.na(new_row_names)]
+    }
+    
+    # Create Seurat object
+    seurat_object <- CreateSeuratObject(counts = matrix_data, project = sample_name)
+    seurat_objects[[sample_name]] <- seurat_object
+  }
+  
+  # Merge all Seurat objects into a single dataset
+  merged_seurat <- Reduce(function(x, y) merge(x, y), seurat_objects)
+  
+  return(merged_seurat)
+}
+
+#----------------------------------------------------------
+# Function to Check if a Gene is Present in a Seurat Object
+#----------------------------------------------------------
+
+check_gene_presence <- function(seurat_obj, gene) {
+  if (!(gene %in% rownames(seurat_obj))) {
+    message(paste("\u274c Gene", gene, "is NOT found in the Seurat object."))
+    return(NULL)
+  }
+  
+  # Fetch gene expression values
+  gene_counts <- FetchData(seurat_obj, vars = gene)
+  
+  # Count the number of cells where the gene is expressed
+  num_cells_expressed <- sum(gene_counts > 0)
+  
+  message(paste("\u2705 Gene", gene, "is present in the Seurat object."))
+  message(paste("Expressed in", num_cells_expressed, "out of", ncol(seurat_obj), "cells."))
+  
+  return(num_cells_expressed)
+}
